@@ -1,63 +1,32 @@
 import { AzureOpenAI } from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
 import { clampThinkingLevel } from "../models.ts";
-import type {
-	Api,
-	AssistantMessage,
-	Context,
-	Model,
-	SimpleStreamOptions,
-	StreamFunction,
-	StreamOptions,
-} from "../types.ts";
+import type { Api, AssistantMessage, Model, SimpleStreamOptions, StreamFunction, TranscriptContext } from "../types.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
-import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
+import { type AzureEndpointOptions, resolveAzureConfig, resolveDeploymentName } from "./azure-openai-config.ts";
+import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
-import { buildBaseOptions } from "./simple-options.ts";
+import { buildBaseOptions, resolveSamplingParams } from "./simple-options.ts";
 
-const DEFAULT_AZURE_API_VERSION = "v1";
-const AZURE_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode", "azure-openai-responses"]);
+const AZURE_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode", "azure"]);
 // OpenAI Responses rejects max_output_tokens below 16: https://github.com/earendil-works/pi/issues/6265
 const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS = 16;
-
-function parseDeploymentNameMap(value: string | undefined): Map<string, string> {
-	const map = new Map<string, string>();
-	if (!value) return map;
-	for (const entry of value.split(",")) {
-		const trimmed = entry.trim();
-		if (!trimmed) continue;
-		const [modelId, deploymentName] = trimmed.split("=", 2);
-		if (!modelId || !deploymentName) continue;
-		map.set(modelId.trim(), deploymentName.trim());
-	}
-	return map;
-}
-
-function resolveDeploymentName(model: Model<"azure-openai-responses">, options?: AzureOpenAIResponsesOptions): string {
-	if (options?.azureDeploymentName) {
-		return options.azureDeploymentName;
-	}
-	const mappedDeployment = parseDeploymentNameMap(
-		getProviderEnvValue("AZURE_OPENAI_DEPLOYMENT_NAME_MAP", options?.env),
-	).get(model.id);
-	return mappedDeployment || model.id;
-}
 
 function formatAzureOpenAIError(error: unknown): string {
 	return formatProviderError(normalizeProviderError(error), "Azure OpenAI API error");
 }
 
 // Azure OpenAI Responses-specific options
-export interface AzureOpenAIResponsesOptions extends StreamOptions {
-	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+export interface AzureOpenAIResponsesOptions extends AzureEndpointOptions {
+	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	toolChoice?: ResponseCreateParamsStreaming["tool_choice"];
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
-	azureApiVersion?: string;
-	azureResourceName?: string;
-	azureBaseUrl?: string;
-	azureDeploymentName?: string;
 }
 
 /**
@@ -65,10 +34,11 @@ export interface AzureOpenAIResponsesOptions extends StreamOptions {
  */
 export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIResponsesOptions> = (
 	model: Model<"azure-openai-responses">,
-	context: Context,
+	context: TranscriptContext,
 	options?: AzureOpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
+	const normalizedContext = resolveTranscript(context, model.compat?.supportsMidConvoSystemMessages);
 
 	// Start async processing
 	(async () => {
@@ -88,7 +58,7 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 				totalTokens: 0,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
-			stopReason: "stop",
+			stopReason: "pending",
 			timestamp: Date.now(),
 		};
 
@@ -99,7 +69,11 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 				throw new Error(`No API key for provider: ${model.provider}`);
 			}
 			const client = createClient(model, apiKey, options);
-			let params = buildParams(model, context, options, deploymentName);
+			const grammarToolInputProperties = createGrammarToolInputProperties(
+				getDeclaredTools(normalizedContext.messages),
+				model.compat?.supportsOpenAIGrammarTools ?? false,
+			);
+			let params = buildParams(model, normalizedContext, options, deploymentName, grammarToolInputProperties);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as ResponseCreateParamsStreaming;
@@ -107,20 +81,33 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
-				maxRetries: options?.maxRetries ?? 0,
+				maxRetries: 0,
 			};
-			const { data: openaiStream, response } = await client.responses.create(params, requestOptions).withResponse();
+			const { data: openaiStream, response } = await retryProviderRequest(
+				() => client.responses.create(params, requestOptions).withResponse(),
+				{
+					maxRetries: options?.maxRetries,
+					maxRetryDelayMs: options?.maxRetryDelayMs,
+					signal: options?.signal,
+				},
+			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
-			await processResponsesStream(openaiStream, output, stream, model);
+			await processResponsesStream(openaiStream, output, stream, model, {
+				onProviderStreamEvent: options?.onProviderStreamEvent,
+				grammarToolInputProperties,
+			});
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
 
+			if (output.stopReason === "pending") {
+				throw new Error("Azure OpenAI Responses stream ended without a stop reason");
+			}
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
-				throw new Error("An unknown error occurred");
+				throw new Error(output.errorMessage || "An unknown error occurred");
 			}
 
 			stream.push({ type: "done", reason: output.stopReason, message: output });
@@ -128,8 +115,9 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 		} catch (error) {
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
-				// partialJson is only a streaming scratch buffer; never persist it.
+				// Streaming scratch buffers are only used during parsing; never persist them.
 				delete (block as { partialJson?: string }).partialJson;
+				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatAzureOpenAIError(error);
@@ -143,7 +131,7 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 
 export const streamSimple: StreamFunction<"azure-openai-responses", SimpleStreamOptions> = (
 	model: Model<"azure-openai-responses">,
-	context: Context,
+	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
 	const apiKey = options?.apiKey;
@@ -151,7 +139,10 @@ export const streamSimple: StreamFunction<"azure-openai-responses", SimpleStream
 		throw new Error(`No API key for provider: ${model.provider}`);
 	}
 
-	const base = buildBaseOptions(model, context, options, apiKey);
+	const base = {
+		...buildBaseOptions(model, context, options, apiKey),
+		toolChoice: options?.toolChoice,
+	} satisfies AzureOpenAIResponsesOptions;
 	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
 	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
 
@@ -161,78 +152,8 @@ export const streamSimple: StreamFunction<"azure-openai-responses", SimpleStream
 	} satisfies AzureOpenAIResponsesOptions);
 };
 
-function normalizeAzureBaseUrl(baseUrl: string): string {
-	const trimmed = baseUrl.trim().replace(/\/+$/, "");
-	let url: URL;
-	try {
-		url = new URL(trimmed);
-	} catch {
-		throw new Error(`Invalid Azure OpenAI base URL: ${baseUrl}`);
-	}
-
-	const isAzureHost =
-		url.hostname.endsWith(".openai.azure.com") ||
-		url.hostname.endsWith(".cognitiveservices.azure.com") ||
-		url.hostname.endsWith(".ai.azure.com");
-	const normalizedPath = url.pathname.replace(/\/+$/, "");
-
-	// Ensure Azure hosts have /openai/v1 as base path so the AzureOpenAI SDK
-	// can append /deployments/<model>/... and ?api-version=v1 correctly.
-	if (
-		isAzureHost &&
-		(normalizedPath === "" ||
-			normalizedPath === "/" ||
-			normalizedPath === "/openai" ||
-			normalizedPath === "/openai/v1/responses")
-	) {
-		url.pathname = "/openai/v1";
-		url.search = "";
-	}
-
-	return url.toString().replace(/\/+$/, "");
-}
-
-function buildDefaultBaseUrl(resourceName: string): string {
-	return `https://${resourceName}.openai.azure.com/openai/v1`;
-}
-
-function resolveAzureConfig(
-	model: Model<"azure-openai-responses">,
-	options?: AzureOpenAIResponsesOptions,
-): { baseUrl: string; apiVersion: string } {
-	const apiVersion =
-		options?.azureApiVersion ||
-		getProviderEnvValue("AZURE_OPENAI_API_VERSION", options?.env) ||
-		DEFAULT_AZURE_API_VERSION;
-
-	const baseUrl =
-		options?.azureBaseUrl?.trim() || getProviderEnvValue("AZURE_OPENAI_BASE_URL", options?.env)?.trim() || undefined;
-	const resourceName = options?.azureResourceName || getProviderEnvValue("AZURE_OPENAI_RESOURCE_NAME", options?.env);
-
-	let resolvedBaseUrl = baseUrl;
-
-	if (!resolvedBaseUrl && resourceName) {
-		resolvedBaseUrl = buildDefaultBaseUrl(resourceName);
-	}
-
-	if (!resolvedBaseUrl && model.baseUrl) {
-		resolvedBaseUrl = model.baseUrl;
-	}
-
-	if (!resolvedBaseUrl) {
-		throw new Error(
-			"Azure OpenAI base URL is required. Set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME, or pass azureBaseUrl, azureResourceName, or model.baseUrl.",
-		);
-	}
-
-	return {
-		baseUrl: normalizeAzureBaseUrl(resolvedBaseUrl),
-		apiVersion,
-	};
-}
-
 function createClient(model: Model<"azure-openai-responses">, apiKey: string, options?: AzureOpenAIResponsesOptions) {
-	const headers = { ...model.headers };
+	const headers = { "User-Agent": getPiUserAgent(), ...model.headers };
 
 	if (options?.headers) {
 		Object.assign(headers, options.headers);
@@ -244,6 +165,7 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 		apiKey,
 		apiVersion,
 		dangerouslyAllowBrowser: true,
+		fetch: options?.fetch,
 		defaultHeaders: headers,
 		baseURL: baseUrl,
 	});
@@ -251,11 +173,27 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 
 function buildParams(
 	model: Model<"azure-openai-responses">,
-	context: Context,
+	context: TranscriptContext,
 	options: AzureOpenAIResponsesOptions | undefined,
 	deploymentName: string,
+	grammarToolInputProperties: ReadonlyMap<string, string> = createGrammarToolInputProperties(
+		getDeclaredTools(context.messages),
+		model.compat?.supportsOpenAIGrammarTools ?? false,
+	),
 ) {
-	const messages = convertResponsesMessages(model, context, AZURE_TOOL_CALL_PROVIDERS);
+	const supportsAdditionalTools = model.compat?.supportsAdditionalTools ?? false;
+	const supportsToolSearch = model.compat?.supportsToolSearch ?? false;
+	const transcriptTools = resolveTranscriptTools(context.messages, supportsAdditionalTools || supportsToolSearch);
+	const messages = convertResponsesMessages(model, context, AZURE_TOOL_CALL_PROVIDERS, {
+		grammarToolInputProperties,
+		supportsMidConvoSystemMessages: model.compat?.supportsMidConvoSystemMessages ?? false,
+		supportsAdditionalTools,
+		supportsToolSearch,
+		toolOptions: {
+			supportsStrictMode: model.compat?.supportsStrictMode ?? true,
+			supportsOpenAIGrammarTools: model.compat?.supportsOpenAIGrammarTools ?? false,
+		},
+	});
 
 	const params: ResponseCreateParamsStreaming = {
 		model: deploymentName,
@@ -273,15 +211,22 @@ function buildParams(
 		params.temperature = options?.temperature;
 	}
 
-	if (context.tools && context.tools.length > 0) {
-		params.tools = convertResponsesTools(context.tools);
+	if (transcriptTools.requestTools.length > 0) {
+		params.tools = convertResponsesTools(transcriptTools.requestTools, {
+			supportsStrictMode: model.compat?.supportsStrictMode ?? true,
+			supportsOpenAIGrammarTools: model.compat?.supportsOpenAIGrammarTools ?? false,
+		});
+	}
+	if (options?.toolChoice !== undefined) {
+		params.tool_choice = options.toolChoice;
 	}
 
+	const reasoningEffort = options?.reasoningEffort ?? (options?.reasoningSummary ? "medium" : undefined);
 	if (model.reasoning) {
-		if (options?.reasoningEffort || options?.reasoningSummary) {
+		if (reasoningEffort) {
 			const effort = options?.reasoningEffort
 				? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)
-				: "medium";
+				: reasoningEffort;
 			params.reasoning = {
 				effort: effort as NonNullable<typeof params.reasoning>["effort"],
 				summary: options?.reasoningSummary || "auto",
@@ -292,6 +237,12 @@ function buildParams(
 				effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<typeof params.reasoning>["effort"],
 			};
 		}
+	}
+
+	// Last so model and request sampling parameters override named request fields.
+	const samplingParams = resolveSamplingParams(model, reasoningEffort ?? "off", options?.samplingParams);
+	if (samplingParams) {
+		Object.assign(params, samplingParams);
 	}
 
 	return params;

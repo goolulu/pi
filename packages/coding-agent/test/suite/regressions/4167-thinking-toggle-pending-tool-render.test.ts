@@ -37,17 +37,20 @@ type RenderSessionContextThis = {
 	pendingTools: Map<string, ToolExecutionComponent>;
 	chatContainer: Container;
 	footer: { invalidate(): void };
+	programStatus: { handleEvent(): void };
 	ui: TUI;
 	settingsManager: {
 		getShowImages(): boolean;
 		getImageWidthCells(): number;
+		getShowCacheMissNotices(): boolean;
 	};
-	sessionManager: { getCwd(): string };
-	session: { retryAttempt: number };
+	sessionManager: { getCwd(): string; getEntries(): SessionEntry[] };
+	session: { retryAttempt: number; modelRegistry: { find(provider: string, modelId: string): undefined } };
 	toolOutputExpanded: boolean;
 	isInitialized: boolean;
 	updateEditorBorderColor(): void;
 	getRegisteredToolDefinition(toolName: string): undefined;
+	maybeShowAssistantDiagnostics(message: AssistantMessage): void;
 	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void;
 	renderSessionItems: RenderSessionItems;
 };
@@ -66,17 +69,20 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		pendingTools: new Map<string, ToolExecutionComponent>(),
 		chatContainer,
 		footer: { invalidate: vi.fn() },
+		programStatus: { handleEvent: vi.fn() },
 		ui: { requestRender: vi.fn() } as unknown as TUI,
 		settingsManager: {
 			getShowImages: () => false,
 			getImageWidthCells: () => 60,
+			getShowCacheMissNotices: () => false,
 		},
-		sessionManager: { getCwd: () => process.cwd() },
-		session: { retryAttempt: 0 },
+		sessionManager: { getCwd: () => process.cwd(), getEntries: () => [] },
+		session: { retryAttempt: 0, modelRegistry: { find: () => undefined } },
 		toolOutputExpanded: false,
 		isInitialized: true,
 		updateEditorBorderColor: vi.fn(),
 		getRegisteredToolDefinition: (_toolName: string) => undefined,
+		maybeShowAssistantDiagnostics: vi.fn(),
 		renderSessionItems: (InteractiveMode.prototype as unknown as { renderSessionItems: RenderSessionItems })
 			.renderSessionItems,
 		addMessageToChat(message: AgentMessage) {

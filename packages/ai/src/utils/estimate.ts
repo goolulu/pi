@@ -1,17 +1,18 @@
-import type { AssistantMessage, Context, ImageContent, Message, TextContent, Usage } from "../types.ts";
+import type { AssistantMessage, ImageContent, Message, TextContent, TranscriptContext, Usage } from "../types.ts";
+import { getSystemMessageText } from "./text.ts";
 
 export interface ContextUsageEstimate {
 	/** Estimated total context tokens. */
 	tokens: number;
-	/** Tokens reported by the most recent assistant usage block. */
+	/** Tokens reported by the most recent applicable assistant usage block. */
 	usageTokens: number;
-	/** Estimated tokens after the most recent assistant usage block. */
+	/** Estimated tokens after the most recent applicable assistant usage block. */
 	trailingTokens: number;
-	/** Index of the message that provided usage, or null when none exists. */
+	/** Index of the applicable message that provided usage, or null when none exists. */
 	lastUsageIndex: number | null;
 }
 
-const CHARS_PER_TOKEN = 4;
+const CHARS_PER_TOKEN = 3.5;
 const ESTIMATED_IMAGE_CHARS = 4800;
 
 export function calculateContextTokens(usage: Usage): number {
@@ -45,6 +46,13 @@ export function estimateTextAndImageContentTokens(content: string | Array<TextCo
 export function estimateMessageTokens(message: Message): number {
 	let chars = 0;
 
+	if (message.role === "system") {
+		return (
+			estimateTextTokens(getSystemMessageText(message)) +
+			estimateToolsTokens(message.toolsAdded) +
+			estimateToolsTokens(message.toolsRemoved)
+		);
+	}
 	if (message.role === "user") return estimateTextAndImageContentTokens(message.content);
 	if (message.role === "toolResult") return estimateTextAndImageContentTokens(message.content);
 
@@ -61,17 +69,33 @@ export function estimateMessageTokens(message: Message): number {
 }
 
 function getLastAssistantUsageInfo(messages: readonly Message[]): { usage: Usage; index: number } | undefined {
-	for (let i = messages.length - 1; i >= 0; i--) {
+	let latestPrefixTimestamp = Number.NEGATIVE_INFINITY;
+	let usageInfo: { usage: Usage; index: number } | undefined;
+
+	for (let i = 0; i < messages.length; i++) {
 		const message = messages[i];
-		if (message.role !== "assistant") continue;
-		const assistant = message as AssistantMessage;
-		if (assistant.stopReason === "aborted" || assistant.stopReason === "error") continue;
-		if (calculateContextTokens(assistant.usage) > 0) return { usage: assistant.usage, index: i };
+		if (message.role === "assistant") {
+			const assistant = message as AssistantMessage;
+			// A newer prefix message was inserted after this response (for example, a
+			// compaction summary), so its usage cannot describe the current prefix.
+			const usageAppliesToPrefix = assistant.timestamp >= latestPrefixTimestamp;
+			if (
+				usageAppliesToPrefix &&
+				assistant.stopReason !== "aborted" &&
+				assistant.stopReason !== "error" &&
+				calculateContextTokens(assistant.usage) > 0
+			) {
+				usageInfo = { usage: assistant.usage, index: i };
+			}
+		}
+		latestPrefixTimestamp = Math.max(latestPrefixTimestamp, message.timestamp);
 	}
-	return undefined;
+
+	return usageInfo;
 }
 
-function estimateMessages(messages: readonly Message[]): ContextUsageEstimate {
+export function estimateContextTokens(context: TranscriptContext | readonly Message[]): ContextUsageEstimate {
+	const messages = "messages" in context ? context.messages : context;
 	const usageInfo = getLastAssistantUsageInfo(messages);
 	if (usageInfo) {
 		const usageTokens = calculateContextTokens(usageInfo.usage);
@@ -87,25 +111,7 @@ function estimateMessages(messages: readonly Message[]): ContextUsageEstimate {
 	return { tokens, usageTokens: 0, trailingTokens: tokens, lastUsageIndex: null };
 }
 
-function isMessageArray(value: Context | readonly Message[]): value is readonly Message[] {
-	return Array.isArray(value);
-}
-
-export function estimateContextTokens(context: Context | readonly Message[]): ContextUsageEstimate {
-	if (isMessageArray(context)) return estimateMessages(context);
-
-	const estimate = estimateMessages(context.messages);
-	if (estimate.lastUsageIndex !== null) return estimate;
-
-	let prefixTokens = context.systemPrompt ? estimateTextTokens(context.systemPrompt) : 0;
-	if (context.tools && context.tools.length > 0) {
-		prefixTokens += estimateTextTokens(safeJsonStringify(context.tools));
-	}
-
-	return {
-		tokens: estimate.tokens + prefixTokens,
-		usageTokens: estimate.usageTokens,
-		trailingTokens: estimate.trailingTokens + prefixTokens,
-		lastUsageIndex: estimate.lastUsageIndex,
-	};
+function estimateToolsTokens(tools: readonly unknown[] | undefined): number {
+	if (!tools || tools.length === 0) return 0;
+	return estimateTextTokens(safeJsonStringify(tools));
 }

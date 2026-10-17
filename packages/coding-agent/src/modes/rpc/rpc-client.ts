@@ -5,12 +5,13 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import type { SessionStats } from "../../core/agent-session.ts";
+import type { PromptDisposition, QueuedInputDisposition, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
+import type { JsonAgentSessionEvent } from "../json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
 
@@ -46,7 +47,7 @@ export interface ModelInfo {
 	reasoning: boolean;
 }
 
-export type RpcEventListener = (event: AgentEvent) => void;
+export type RpcEventListener = (event: JsonAgentSessionEvent) => void;
 
 // ============================================================================
 // RPC Client
@@ -191,25 +192,32 @@ export class RpcClient {
 
 	/**
 	 * Send a prompt to the agent.
-	 * Returns immediately after sending; use onEvent() to receive streaming events.
-	 * Use waitForIdle() to wait for completion.
+	 * Returns the prompt's disposition after acceptance; use onEvent() to receive streaming events.
+	 * If the disposition is "handled", no run started for this prompt, so don't wait for agent_settled.
 	 */
-	async prompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "prompt", message, images });
+	async prompt(
+		message: string,
+		images?: ImageContent[],
+		streamingBehavior?: "steer" | "followUp",
+	): Promise<PromptDisposition> {
+		const response = await this.send({ type: "prompt", message, images, streamingBehavior });
+		return this.getData<{ disposition: PromptDisposition }>(response).disposition;
 	}
 
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
-	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "steer", message, images });
+	async steer(message: string, images?: ImageContent[]): Promise<QueuedInputDisposition> {
+		const response = await this.send({ type: "steer", message, images });
+		return this.getData<{ disposition: QueuedInputDisposition }>(response).disposition;
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "follow_up", message, images });
+	async followUp(message: string, images?: ImageContent[]): Promise<QueuedInputDisposition> {
+		const response = await this.send({ type: "follow_up", message, images });
+		return this.getData<{ disposition: QueuedInputDisposition }>(response).disposition;
 	}
 
 	/**
@@ -217,6 +225,14 @@ export class RpcClient {
 	 */
 	async abort(): Promise<void> {
 		await this.send({ type: "abort" });
+	}
+
+	/**
+	 * Clear queued steering and follow-up messages, returning their text.
+	 */
+	async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
+		const response = await this.send({ type: "clear_queue" });
+		return this.getData(response);
 	}
 
 	/**
@@ -278,6 +294,14 @@ export class RpcClient {
 	async cycleThinkingLevel(): Promise<{ level: ThinkingLevel } | null> {
 		const response = await this.send({ type: "cycle_thinking_level" });
 		return this.getData(response);
+	}
+
+	/**
+	 * Get list of available thinking levels for the current model.
+	 */
+	async getAvailableThinkingLevels(): Promise<ThinkingLevel[]> {
+		const response = await this.send({ type: "get_available_thinking_levels" });
+		return this.getData<{ levels: ThinkingLevel[] }>(response).levels;
 	}
 
 	/**
@@ -442,7 +466,7 @@ export class RpcClient {
 
 	/**
 	 * Wait for agent to become idle (no streaming).
-	 * Resolves when agent_end event is received.
+	 * Resolves when agent_settled event is received.
 	 */
 	waitForIdle(timeout = 60000): Promise<void> {
 		return new Promise((resolve, reject) => {
@@ -452,7 +476,7 @@ export class RpcClient {
 			}, timeout);
 
 			const unsubscribe = this.onEvent((event) => {
-				if (event.type === "agent_end") {
+				if (event.type === "agent_settled") {
 					clearTimeout(timer);
 					unsubscribe();
 					resolve();
@@ -464,9 +488,9 @@ export class RpcClient {
 	/**
 	 * Collect events until agent becomes idle.
 	 */
-	collectEvents(timeout = 60000): Promise<AgentEvent[]> {
+	collectEvents(timeout = 60000): Promise<JsonAgentSessionEvent[]> {
 		return new Promise((resolve, reject) => {
-			const events: AgentEvent[] = [];
+			const events: JsonAgentSessionEvent[] = [];
 			const timer = setTimeout(() => {
 				unsubscribe();
 				reject(new Error(`Timeout collecting events. Stderr: ${this.stderr}`));
@@ -474,7 +498,7 @@ export class RpcClient {
 
 			const unsubscribe = this.onEvent((event) => {
 				events.push(event);
-				if (event.type === "agent_end") {
+				if (event.type === "agent_settled") {
 					clearTimeout(timer);
 					unsubscribe();
 					resolve(events);
@@ -486,7 +510,7 @@ export class RpcClient {
 	/**
 	 * Send prompt and wait for completion, returning all events.
 	 */
-	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
+	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<JsonAgentSessionEvent[]> {
 		const eventsPromise = this.collectEvents(timeout);
 		await this.prompt(message, images);
 		return eventsPromise;
@@ -508,9 +532,10 @@ export class RpcClient {
 				return;
 			}
 
-			// Otherwise it's an event
-			for (const listener of this.eventListeners) {
-				listener(data as AgentEvent);
+			// Otherwise it's an event. Iterate a snapshot so listeners that unsubscribe during dispatch
+			// do not cause later listeners to miss this event.
+			for (const listener of [...this.eventListeners]) {
+				listener(data as JsonAgentSessionEvent);
 			}
 		} catch {
 			// Ignore non-JSON lines

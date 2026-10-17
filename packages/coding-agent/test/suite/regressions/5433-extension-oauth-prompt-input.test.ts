@@ -19,7 +19,13 @@ function createDialog(): LoginDialogComponent {
 }
 
 function renderDialog(dialog: LoginDialogComponent): string[] {
-	return stripAnsi(dialog.render(120).join("\n"))
+	// stripAnsi keeps APC sequences, so drop the TUI's zero-width cursor markers (e.g. \x1b_pi:fc\x07) first
+	return stripAnsi(
+		dialog
+			.render(120)
+			.join("\n")
+			.replace(/\x1b_[^\x07]*\x07/g, ""),
+	)
 		.split("\n")
 		.map((line) => line.trimEnd());
 }
@@ -68,6 +74,32 @@ describe("LoginDialogComponent OAuth prompts", () => {
 		expect(output).toContain("https://example.invalid/login");
 		expect(output).toContain("Authorize the extension");
 		expect(output).toContain("First prompt:");
+	});
+
+	test("preserves neutral information and links when showing a prompt", () => {
+		const dialog = createDialog();
+
+		dialog.showInfo("Configure credentials outside pi.", [
+			{ label: "Provider documentation", url: "https://example.invalid/docs" },
+		]);
+		dialog.showPrompt("Press Enter to continue:");
+
+		const output = renderDialog(dialog).join("\n");
+		expect(output).toContain("Configure credentials outside pi.");
+		expect(output).toContain("Provider documentation: https://example.invalid/docs");
+		expect(output).toContain("Press Enter to continue:");
+	});
+
+	test("preserves setup details when showing a prompt", () => {
+		const dialog = createDialog();
+
+		dialog.showDetails(["AWS credential setup:", "providers.md"]);
+		dialog.showPrompt("Enter API key:");
+
+		const output = renderDialog(dialog).join("\n");
+		expect(output).toContain("AWS credential setup:");
+		expect(output).toContain("providers.md");
+		expect(output).toContain("Enter API key:");
 	});
 
 	test("keeps previous manual input stable when a later prompt is active", async () => {

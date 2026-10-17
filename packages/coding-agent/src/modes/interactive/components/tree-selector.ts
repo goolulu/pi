@@ -13,6 +13,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { SessionTreeNode } from "../../../core/session-manager.ts";
+import { formatReadLineRange } from "../../../core/tools/render-utils.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { formatKeyText, keyHint } from "./keybinding-hints.ts";
@@ -122,6 +123,7 @@ class TreeList implements Component {
 
 	public onSelect?: (entryId: string) => void;
 	public onCancel?: () => void;
+	public onCopy?: (text: string | undefined) => void;
 	public onLabelEdit?: (entryId: string, currentLabel: string | undefined) => void;
 
 	constructor(
@@ -337,6 +339,7 @@ class TreeList implements Component {
 
 		this.filteredNodes = this.flatNodes.filter((flatNode) => {
 			const entry = flatNode.node.entry;
+			if (entry.type === "usage") return false;
 			const isCurrentLeaf = entry.id === this.currentLeafId;
 
 			// Skip assistant messages with only tool calls (no text) unless error/aborted
@@ -356,6 +359,7 @@ class TreeList implements Component {
 			// Entry types hidden in default view (settings/bookkeeping)
 			const isSettingsEntry =
 				entry.type === "label" ||
+				entry.type === "context_edit" ||
 				entry.type === "custom" ||
 				entry.type === "model_change" ||
 				entry.type === "thinking_level_change" ||
@@ -605,6 +609,9 @@ class TreeList implements Component {
 			case "custom":
 				parts.push("custom", entry.customType);
 				break;
+			case "context_edit":
+				parts.push("context edit", entry.replacement === null ? "omit" : "replace", entry.targetId);
+				break;
 			case "label":
 				parts.push("label", entry.label ?? "");
 				break;
@@ -621,6 +628,11 @@ class TreeList implements Component {
 
 	getSelectedNode(): SessionTreeNode | undefined {
 		return this.filteredNodes[this.selectedIndex]?.node;
+	}
+
+	copySelected(): void {
+		const node = this.getSelectedNode();
+		this.onCopy?.(node ? this.getEntryCopyText(node) : undefined);
 	}
 
 	updateNodeLabel(entryId: string, label: string | undefined, labelTimestamp?: string): void {
@@ -830,6 +842,9 @@ class TreeList implements Component {
 			case "custom":
 				result = theme.fg("dim", `[custom: ${entry.customType}]`);
 				break;
+			case "context_edit":
+				result = theme.fg("dim", `[context ${entry.replacement === null ? "omit" : "replace"}: ${entry.targetId}]`);
+				break;
 			case "label":
 				result = theme.fg("dim", `[label: ${entry.label ?? "(cleared)"}]`);
 				break;
@@ -871,19 +886,49 @@ class TreeList implements Component {
 	}
 
 	private extractContent(content: unknown): string {
-		const maxLen = 200;
-		if (typeof content === "string") return content.slice(0, maxLen);
-		if (Array.isArray(content)) {
-			let result = "";
-			for (const c of content) {
-				if (typeof c === "object" && c !== null && "type" in c && c.type === "text") {
-					result += (c as { text: string }).text;
-					if (result.length >= maxLen) return result.slice(0, maxLen);
-				}
+		return this.extractFullContent(content).slice(0, 200);
+	}
+
+	private extractFullContent(content: unknown): string {
+		if (typeof content === "string") return content;
+		if (!Array.isArray(content)) return "";
+
+		let result = "";
+		for (const block of content) {
+			if (typeof block === "object" && block !== null && "type" in block && block.type === "text") {
+				result += (block as { text: string }).text;
 			}
-			return result;
 		}
-		return "";
+		return result;
+	}
+
+	private getEntryCopyText(node: SessionTreeNode): string | undefined {
+		const entry = node.entry;
+		let text: string | undefined;
+
+		switch (entry.type) {
+			case "message":
+				if (entry.message.role === "bashExecution") {
+					text = entry.message.command;
+				} else if ("content" in entry.message) {
+					text = this.extractFullContent(entry.message.content);
+					if (!text && entry.message.role === "assistant") {
+						text = entry.message.errorMessage;
+					}
+				}
+				break;
+			case "custom_message":
+				text = this.extractFullContent(entry.content);
+				break;
+			case "compaction":
+				text = entry.summary;
+				break;
+			case "branch_summary":
+				text = entry.summary;
+				break;
+		}
+
+		return text?.trim() ? text : undefined;
 	}
 
 	private hasTextContent(content: unknown): boolean {
@@ -909,15 +954,7 @@ class TreeList implements Component {
 		switch (name) {
 			case "read": {
 				const path = shortenPath(String(args.path || args.file_path || ""));
-				const offset = args.offset as number | undefined;
-				const limit = args.limit as number | undefined;
-				let display = path;
-				if (offset !== undefined || limit !== undefined) {
-					const start = offset ?? 1;
-					const end = limit !== undefined ? start + limit - 1 : "";
-					display += `:${start}${end ? `-${end}` : ""}`;
-				}
-				return `[read: ${display}]`;
+				return `[read: ${path}${formatReadLineRange(args.offset, args.limit)}]`;
 			}
 			case "write": {
 				const path = shortenPath(String(args.path || args.file_path || ""));
@@ -990,6 +1027,8 @@ class TreeList implements Component {
 			if (selected && this.onSelect) {
 				this.onSelect(selected.node.entry.id);
 			}
+		} else if (kb.matches(keyData, "app.message.copy")) {
+			this.copySelected();
 		} else if (kb.matches(keyData, "tui.select.cancel")) {
 			if (this.searchQuery) {
 				this.searchQuery = "";
@@ -1180,6 +1219,7 @@ const TREE_HELP_ITEMS: Array<{ keys: Keybinding[]; label: string; labelFirst?: b
 	{ keys: ["tui.select.up", "tui.select.down"], label: "move" },
 	{ keys: ["tui.editor.cursorLeft", "tui.editor.cursorRight"], label: "page" },
 	{ keys: ["app.tree.foldOrUp", "app.tree.unfoldOrDown"], label: "branch" },
+	{ keys: ["app.message.copy"], label: "copy" },
 	{ keys: ["app.tree.editLabel"], label: "label" },
 	{ keys: ["app.tree.toggleLabelTimestamp"], label: "label time" },
 	{
@@ -1292,6 +1332,7 @@ export class TreeSelectorComponent extends Container implements Focusable {
 	private labelInputContainer: Container;
 	private treeContainer: Container;
 	private onLabelChangeCallback?: (entryId: string, label: string | undefined) => void;
+	public onCopy?: (text: string | undefined) => void;
 
 	// Focusable implementation - propagate to labelInput when active for IME cursor positioning
 	private _focused = false;
@@ -1324,6 +1365,7 @@ export class TreeSelectorComponent extends Container implements Focusable {
 		this.treeList = new TreeList(tree, currentLeafId, maxVisibleLines, initialSelectedId, initialFilterMode);
 		this.treeList.onSelect = onSelect;
 		this.treeList.onCancel = onCancel;
+		this.treeList.onCopy = (text) => this.onCopy?.(text);
 		this.treeList.onLabelEdit = (entryId, currentLabel) => this.showLabelInput(entryId, currentLabel);
 
 		this.treeContainer = new Container();
