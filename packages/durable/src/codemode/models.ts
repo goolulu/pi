@@ -17,7 +17,7 @@ import type {
 	ModelTypeMap,
 	Usage,
 } from "@earendil-works/pi-ai";
-import { Type } from "typebox";
+import { obj, unknown } from "@earendil-works/pi-schema";
 import { defineTool } from "../harness/define.ts";
 import type { ToolRegistration } from "../harness/types.ts";
 
@@ -227,7 +227,7 @@ function resolveModel<TType extends "classifier" | "image">(
 	);
 }
 
-const ModelCallParameters = Type.Object({ model: Type.Unknown(), context: Type.Unknown() });
+const ModelCallParameters = obj({ model: unknown(), context: unknown() }, { open: true });
 
 /** The result of a model call as the tool returns it: the whole result for the script, usage counted by the Harness. */
 function modelResult(
@@ -255,12 +255,13 @@ export function createModelTools(): ToolRegistration[] {
 		name: CLASSIFY_TOOL,
 		description: "models.classify() of code mode scripts.",
 		parameters: ModelCallParameters,
-		structuredOutputSchema: Type.Unknown(),
+		structuredOutputSchema: unknown(),
 		callers: ["tools"],
 		execute: async (args, api, context) => {
 			const model = resolveModel("models.classify", "classifier", args.model, api.models);
 			const checked = checkClassifierContext(args.context);
 			const result = await api.models.classify(model, checked, {
+				telemetry: context.telemetry,
 				...(context.abortSignal === undefined ? {} : { signal: context.abortSignal }),
 			});
 			return modelResult(`classify ${model.provider}/${model.id}`, result, result);
@@ -270,12 +271,13 @@ export function createModelTools(): ToolRegistration[] {
 		name: GENERATE_IMAGES_TOOL,
 		description: "models.generateImages() of code mode scripts.",
 		parameters: ModelCallParameters,
-		structuredOutputSchema: Type.Unknown(),
+		structuredOutputSchema: unknown(),
 		callers: ["tools"],
 		execute: async (args, api, context) => {
 			const model = resolveModel("models.generateImages", "image", args.model, api.models);
 			const checked = checkImagesContext(args.context);
 			const result = await api.models.generateImages(model, checked, {
+				telemetry: context.telemetry,
 				...(context.abortSignal === undefined ? {} : { signal: context.abortSignal }),
 			});
 			return modelResult(`generateImages ${model.provider}/${model.id}`, result, result);
